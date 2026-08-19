@@ -16,6 +16,7 @@ API:
 
 import argparse
 import glob
+import hashlib
 import logging
 import os
 import random
@@ -26,6 +27,61 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _fold_u64(data: bytes) -> int:
+    """Stable 64-bit fold of `data` (blake2b truncated) for the KV content
+    fingerprint identity. Deterministic across processes/nodes so a
+    content-addressed KV tile warmed on one node is a hit on all."""
+    return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+
+
+def _ensure_kv_identity(model, tokenizer, model_dir: "str | None") -> None:
+    """Fold the tokenizer + checkpoint identity into the NAS KV content
+    fingerprint ONCE per process (NAS prefix-cache Phase 1, scope §3.3): a
+    tokenizer bump or re-quant then MISSES cleanly instead of serving stale KV.
+
+    Complements the `SessionKvManager`, which OWNS the resident/NAS restore
+    policy (`prepare` continues a warm session or `kv_cache_load`s a cold prefix;
+    `persist` `kv_cache_store`s). This only ARMS the identity the Rust
+    `content_fingerprint` folds — it never restores or resets KV itself, so it
+    can't double-restore or fight the session. No-op if the model lacks the
+    pymethod (older `_rs` build) or the identity is already set."""
+    if getattr(model, "_kv_identity_set", False):
+        return
+    setter = getattr(model, "kv_cache_set_identity", None)
+    if setter is None:
+        return
+    # tokenizer identity: name + vocab size + a hash of the merges/vocab file if
+    # discoverable; falls back to name_or_path + vocab_size (still catches a swap).
+    tok_bytes = f"{getattr(tokenizer, 'name_or_path', '')}|{tokenizer.vocab_size}".encode()
+    tok_file = None
+    if model_dir:
+        for cand in ("tokenizer.json", "tokenizer.model"):
+            p = os.path.join(model_dir, cand)
+            if os.path.exists(p):
+                tok_file = p
+                break
+    if tok_file:
+        with open(tok_file, "rb") as fh:
+            tok_bytes = fh.read()
+    tokenizer_hash = _fold_u64(tok_bytes)
+    # weights identity: hash of the safetensors index (or the sorted shard
+    # (name, size) listing) so a re-quant changes the id. 0 when undiscoverable
+    # (the store stays self-consistent; the tokenizer hash still gates drift).
+    weights_id = 0
+    if model_dir:
+        idx = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            with open(idx, "rb") as fh:
+                weights_id = _fold_u64(fh.read())
+        else:
+            shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+            listing = "".join(f"{os.path.basename(s)}:{os.path.getsize(s)}" for s in shards)
+            if listing:
+                weights_id = _fold_u64(listing.encode())
+    setter(weights_id, tokenizer_hash)
+    model._kv_identity_set = True
 
 
 def find_safetensors(model_name_or_path: str) -> str:
@@ -142,10 +198,17 @@ def generate(
     temperature: float = 1.0,
     top_p: float = 0.95,
     top_k: int = 64,
+    session=None,
 ) -> tuple[str, int, int]:
     """Generate a response using the Rust VulkanModel.
 
     Returns: (generated_text, num_prompt_tokens, num_completion_tokens)
+
+    ``session`` (optional ``SessionKvManager``): when supplied and enabled, the
+    model's KV cache is kept alive across requests and only the appended tail of
+    a continuing conversation is prefilled (Item 3 — session-KV continuation).
+    When ``None`` or disabled, behavior is byte-identical to the legacy
+    reset+full-prefill.
     """
     # Format prompt using the tokenizer's chat template.
     prompt = tokenizer.apply_chat_template(
@@ -153,14 +216,35 @@ def generate(
     )
     input_ids = tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
 
-    # Reset and prefill KV cache.
-    model.reset_kv_cache()
+    # NAS prefix-cache (Phase 1): arm the model/tokenizer identity folded into the
+    # KV content fingerprint ONCE (idempotent). This does NOT restore or reset KV
+    # — the SessionKvManager below owns that (resident continuation on a warm turn,
+    # `kv_cache_load` on a cold prefix). Arming here just makes a re-quant /
+    # tokenizer bump MISS cleanly instead of serving stale gemma/Laguna tiles.
+    _model_dir = getattr(tokenizer, "name_or_path", None)
+    _model_dir = _model_dir if _model_dir and os.path.isdir(_model_dir) else None
+    _ensure_kv_identity(model, tokenizer, _model_dir)
 
-    # Prefill: run forward for each prompt token except the last (whose
-    # logits are the ones actually sampled from below) — advances the KV
-    # cache only, discarding logits nothing will read.
-    for pos, token_id in enumerate(input_ids[:-1]):
-        model.forward(token_id, pos)
+    # Reset-or-continue the KV cache. With no session (or a disabled one) this
+    # resets and starts at 0 == the legacy full re-prefill; an enabled session
+    # continuing a transcript returns the resident prefix length so ONLY the
+    # appended tail is prefilled (bit-exact by construction — see the Rust gate
+    # session_continuation_matches_full_reprefill).
+    if session is not None:
+        start = session.prepare(input_ids)
+    else:
+        model.reset_kv_cache()
+        start = 0
+    # Never prefill past the last token (its logits are what we sample from);
+    # clamp so a full residency hit still re-forwards the final token to produce
+    # a fresh logit vector.
+    start = min(start, len(input_ids) - 1)
+
+    # Prefill: run forward for each prompt token from `start` except the last
+    # (whose logits are sampled below) — advances the KV cache only, discarding
+    # logits nothing will read.
+    for pos in range(start, len(input_ids) - 1):
+        model.forward(input_ids[pos], pos)
 
     # Get next token from the last prefill step. forward_and_sample (Rust)
     # replaces forward() + greedy_sample()/temperature_sample(): sampling
@@ -176,22 +260,41 @@ def generate(
     next_token = model.forward_and_sample(
         input_ids[-1], last_pos, temperature, top_p, top_k, random.random()
     )
+    # The whole prompt is now resident in the KV (prefill loop + the final
+    # token just forwarded above); record it so the next turn can continue.
+    if session is not None:
+        session.mark_resident(input_ids)
 
     # Decode: generate new tokens.
     generated_ids: list[int] = []
     pos = len(input_ids)
     eos_token_id = tokenizer.eos_token_id
-    stop_tokens = {eos_token_id, 106}  # 106 = <end_of_turn> in Gemma
+    # Stop on EOS plus any chat end-of-turn marker the tokenizer defines.
+    # Covers Gemma (<end_of_turn>) and Qwen3 (<|im_end|>) without hardcoding ids.
+    stop_tokens = {eos_token_id}
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    for marker in ("<end_of_turn>", "<|im_end|>"):
+        tid = tokenizer.convert_tokens_to_ids(marker)
+        if tid is not None and tid != unk_id:
+            stop_tokens.add(tid)
 
     while len(generated_ids) < max_new_tokens:
         generated_ids.append(next_token)
         if next_token in stop_tokens:
             break
 
+        # forward_and_sample forwards `next_token` at `pos` (advancing the KV)
+        # and returns the following token; record `next_token` as now-resident.
+        if session is not None:
+            session.observe(next_token)
         next_token = model.forward_and_sample(
             next_token, pos, temperature, top_p, top_k, random.random()
         )
         pos += 1
+
+    # Persist the (exact) resident context to the NAS overflow tier, if on.
+    if session is not None:
+        session.persist()
 
     # Remove trailing EOS/end-of-turn tokens.
     while generated_ids and generated_ids[-1] in stop_tokens:
@@ -209,6 +312,25 @@ def make_app(model_name: str, model, tokenizer):
     from fastapi.responses import JSONResponse
 
     app = FastAPI(title="vllm-vulkan API server")
+
+    # One persistent session manager per server process: it keeps the single
+    # resident KV cache alive across requests and continues (rather than
+    # reset+full-reprefills) whenever a request extends the resident transcript.
+    # Disabled by default (unset VLLM_VULKAN_SESSION_KV and VLLM_VULKAN_KV_STORE_DIR
+    # => reset+full-prefill every turn, byte-identical to the legacy path).
+    from .session_kv import SessionKvManager
+
+    session = SessionKvManager(model)
+    if session.enabled:
+        logger.info(
+            "session-KV continuation ENABLED (resident-first%s)",
+            " + NAS overflow" if session.use_nas else "",
+        )
+    # Serialize requests: the model owns ONE KV cache, and continuation is
+    # single-stream (max_num_seqs=1) by construction.
+    import threading
+
+    session_lock = threading.Lock()
 
     @app.get("/health")
     async def health():
@@ -237,12 +359,18 @@ def make_app(model_name: str, model, tokenizer):
             top_p = request.get("top_p", 0.95)
             top_k = request.get("top_k", 64)
 
+            def _run():
+                # The lock makes concurrent HTTP requests serialize onto the one
+                # resident KV cache (no interleaving of two sessions' prefills).
+                with session_lock:
+                    return generate(
+                        model, tokenizer, messages, max_tokens,
+                        temperature, top_p, top_k, session=session,
+                    )
+
             t0 = time.perf_counter()
             text, n_prompt, n_gen = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: generate(
-                    model, tokenizer, messages, max_tokens, temperature, top_p, top_k
-                ),
+                None, _run
             )
             elapsed = time.perf_counter() - t0
             tok_per_sec = n_gen / elapsed if elapsed > 0 else 0
