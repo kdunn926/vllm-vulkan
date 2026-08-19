@@ -48,3 +48,23 @@ jobs:
     - name: Test
       run: |
         scripts/test.sh
+
+  # Compile the crate's own Rust test binary under the model-free foundation
+  # feature slice. scripts/test.sh only runs pytest, so `cargo test` never ran in
+  # CI — which let #[cfg(test)] modules that reference model-gated symbols break
+  # `cargo test --no-default-features --features multiple-pymethods` invisibly.
+  # --no-run builds the test binary (catching that cfg/gating regression class)
+  # without needing a GPU or an embedded-interpreter runtime.
+  rust-test-foundation:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Compile foundation-slice test binary
+      run: |
+        cargo test --no-default-features --features "multiple-pymethods" --lib --no-run
