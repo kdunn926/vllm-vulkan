@@ -12,13 +12,20 @@ Public API:
     RustEngineClient, RustBackend, DummyRustBackend, VulkanRustBackend
     RustModelConfig, RustVllmConfig
 """
+
 from .app import build_app, serve
 from .backend import DummyRustBackend, RustBackend, Step, VulkanRustBackend
 from .config_stub import RustModelConfig, RustVllmConfig
 from .engine_client import RustEngineClient
 
 __all__ = [
-    "build_app", "serve",
-    "RustEngineClient", "RustBackend", "DummyRustBackend", "VulkanRustBackend", "Step",
-    "RustModelConfig", "RustVllmConfig",
+    "build_app",
+    "serve",
+    "RustEngineClient",
+    "RustBackend",
+    "DummyRustBackend",
+    "VulkanRustBackend",
+    "Step",
+    "RustModelConfig",
+    "RustVllmConfig",
 ]

@@ -54,7 +54,9 @@ def _ensure_kv_identity(model, tokenizer, model_dir: "str | None") -> None:
         return
     # tokenizer identity: name + vocab size + a hash of the merges/vocab file if
     # discoverable; falls back to name_or_path + vocab_size (still catches a swap).
-    tok_bytes = f"{getattr(tokenizer, 'name_or_path', '')}|{tokenizer.vocab_size}".encode()
+    tok_bytes = (
+        f"{getattr(tokenizer, 'name_or_path', '')}|{tokenizer.vocab_size}".encode()
+    )
     tok_file = None
     if model_dir:
         for cand in ("tokenizer.json", "tokenizer.model"):
@@ -77,7 +79,9 @@ def _ensure_kv_identity(model, tokenizer, model_dir: "str | None") -> None:
                 weights_id = _fold_u64(fh.read())
         else:
             shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-            listing = "".join(f"{os.path.basename(s)}:{os.path.getsize(s)}" for s in shards)
+            listing = "".join(
+                f"{os.path.basename(s)}:{os.path.getsize(s)}" for s in shards
+            )
             if listing:
                 weights_id = _fold_u64(listing.encode())
     setter(weights_id, tokenizer_hash)
@@ -364,8 +368,14 @@ def make_app(model_name: str, model, tokenizer):
                 # resident KV cache (no interleaving of two sessions' prefills).
                 with session_lock:
                     return generate(
-                        model, tokenizer, messages, max_tokens,
-                        temperature, top_p, top_k, session=session,
+                        model,
+                        tokenizer,
+                        messages,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        top_k,
+                        session=session,
                     )
 
             t0 = time.perf_counter()

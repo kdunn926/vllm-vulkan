@@ -25,6 +25,7 @@ sampler runs in Rust, so to serve `logprobs` the backend Step must also carry th
 chosen token's logprob (and top-k), which this adapter would wrap in
 vllm.logprobs.Logprob. Text/finish_reason are fully handled.
 """
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
@@ -32,10 +33,10 @@ from collections.abc import AsyncGenerator
 from vllm.engine.protocol import EngineClient
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.core.sched.utils import check_stop
 
 from .backend import RustBackend
 
@@ -66,6 +67,7 @@ def _allowed_leads(bos_id):
     scripts/chat_prompt_guard.resolve_allowed_leads). Default => {bos_id} only.
     """
     import os
+
     leads = set()
     if bos_id is not None:
         leads.add(int(bos_id))
@@ -95,6 +97,7 @@ def _assert_chat_prompt(prompt_ids, bos_id) -> None:
     opt-out for deliberate raw-token debug only: VLLM_VULKAN_ALLOW_RAW_PROMPT=1.
     """
     import os
+
     if _truthy(os.environ.get("VLLM_VULKAN_ALLOW_RAW_PROMPT")):
         return
     leads = _allowed_leads(bos_id)
@@ -111,17 +114,19 @@ def _assert_chat_prompt(prompt_ids, bos_id) -> None:
             "bypassed; a chat model fed a raw prompt degenerates to [tok]xN. Route "
             "through the OpenAI serving renderer; a control-token-led model declares "
             "its lead via VLLM_VULKAN_CHAT_LEAD_TOKENS; or set "
-            "VLLM_VULKAN_ALLOW_RAW_PROMPT=1 for deliberate raw-token debugging.")
+            "VLLM_VULKAN_ALLOW_RAW_PROMPT=1 for deliberate raw-token debugging."
+        )
 
 
 class RustEngineClient(EngineClient):
-    def __init__(self, vllm_config, renderer, backend: RustBackend, tokenizer,
-                 clock_manager=None):
+    def __init__(
+        self, vllm_config, renderer, backend: RustBackend, tokenizer, clock_manager=None
+    ):
         # Attributes the OpenAI serving layer / renderer read (see config_stub).
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        self.renderer = renderer          # the REAL HfRenderer
-        self.input_processor = None        # stored, never called on these paths
+        self.renderer = renderer  # the REAL HfRenderer
+        self.input_processor = None  # stored, never called on these paths
         # Ours:
         self._backend = backend
         self._tokenizer = tokenizer
@@ -147,7 +152,8 @@ class RustEngineClient(EngineClient):
             await cm.acquire()
         try:
             async for out in self._generate_impl(
-                    prompt, sampling_params, request_id, *args, **kwargs):
+                prompt, sampling_params, request_id, *args, **kwargs
+            ):
                 yield out
         finally:
             if cm is not None:
@@ -157,27 +163,43 @@ class RustEngineClient(EngineClient):
         self, prompt, sampling_params, request_id, *args, **kwargs
     ) -> AsyncGenerator[RequestOutput, None]:
         prompt_ids = _prompt_token_ids(prompt)
-        _assert_chat_prompt(prompt_ids, self._bos_token_id)   # anti-misprompt tripwire
-        streaming = getattr(sampling_params, "output_kind", None) == RequestOutputKind.DELTA
+        _assert_chat_prompt(prompt_ids, self._bos_token_id)  # anti-misprompt tripwire
+        streaming = (
+            getattr(sampling_params, "output_kind", None) == RequestOutputKind.DELTA
+        )
 
         # Give the sampling params an EOS so check_stop halts on it (unless the
         # request set ignore_eos, in which case leave it unset).
-        if not getattr(sampling_params, "ignore_eos", False) and self._eos_token_id is not None:
+        if (
+            not getattr(sampling_params, "ignore_eos", False)
+            and self._eos_token_id is not None
+        ):
             try:
                 if getattr(sampling_params, "eos_token_id", None) is None:
-                    sampling_params.update_from_generation_config({}, eos_token_id=self._eos_token_id)
+                    sampling_params.update_from_generation_config(
+                        {}, eos_token_id=self._eos_token_id
+                    )
             except Exception:
                 pass
 
         ecr = EngineCoreRequest(
-            request_id=request_id, prompt_token_ids=list(prompt_ids),
-            mm_features=None, sampling_params=sampling_params, pooling_params=None,
-            arrival_time=0.0, lora_request=None, cache_salt=None, data_parallel_rank=None,
+            request_id=request_id,
+            prompt_token_ids=list(prompt_ids),
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
         )
         det = IncrementalDetokenizer.from_new_request(self._tokenizer, ecr)
         req = Request(
-            request_id=request_id, prompt_token_ids=list(prompt_ids),
-            sampling_params=sampling_params, pooling_params=None, block_hasher=None,
+            request_id=request_id,
+            prompt_token_ids=list(prompt_ids),
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_hasher=None,
         )
 
         finish_reason: FinishReason | None = None
@@ -207,16 +229,28 @@ class RustEngineClient(EngineClient):
             if streaming:
                 # DELTA: emit the incremental piece (+ this step's token id).
                 yield self._request_output(
-                    request_id, prompt_ids, text, [tid],
-                    finish_reason, stop_reason, finished, det,
+                    request_id,
+                    prompt_ids,
+                    text,
+                    [tid],
+                    finish_reason,
+                    stop_reason,
+                    finished,
+                    det,
                 )
             if finished or step.done:
                 if not streaming:
                     # FINAL_ONLY: one cumulative output at the end.
                     full = det.get_next_output_text(finished=True, delta=False)
                     yield self._request_output(
-                        request_id, prompt_ids, full, list(det.output_token_ids),
-                        finish_reason, stop_reason, True, det,
+                        request_id,
+                        prompt_ids,
+                        full,
+                        list(det.output_token_ids),
+                        finish_reason,
+                        stop_reason,
+                        True,
+                        det,
                     )
                 return
 
@@ -224,21 +258,44 @@ class RustEngineClient(EngineClient):
         if not streaming:
             full = det.get_next_output_text(finished=True, delta=False)
             yield self._request_output(
-                request_id, prompt_ids, full, list(det.output_token_ids),
-                finish_reason, stop_reason, True, det,
+                request_id,
+                prompt_ids,
+                full,
+                list(det.output_token_ids),
+                finish_reason,
+                stop_reason,
+                True,
+                det,
             )
 
-    def _request_output(self, request_id, prompt_ids, text, token_ids,
-                        finish_reason, stop_reason, finished, det) -> RequestOutput:
+    def _request_output(
+        self,
+        request_id,
+        prompt_ids,
+        text,
+        token_ids,
+        finish_reason,
+        stop_reason,
+        finished,
+        det,
+    ) -> RequestOutput:
         co = CompletionOutput(
-            index=0, text=text, token_ids=token_ids,
-            cumulative_logprob=None, logprobs=None,   # see module docstring (logprobs TODO)
+            index=0,
+            text=text,
+            token_ids=token_ids,
+            cumulative_logprob=None,
+            logprobs=None,  # see module docstring (logprobs TODO)
             finish_reason=str(finish_reason) if finish_reason is not None else None,
             stop_reason=stop_reason,
         )
         return RequestOutput(
-            request_id=request_id, prompt=None, prompt_token_ids=list(prompt_ids),
-            prompt_logprobs=None, outputs=[co], finished=finished, num_cached_tokens=0,
+            request_id=request_id,
+            prompt=None,
+            prompt_token_ids=list(prompt_ids),
+            prompt_logprobs=None,
+            outputs=[co],
+            finished=finished,
+            num_cached_tokens=0,
         )
 
     # ---- lifecycle / health: trivial (23 methods) -----------------------

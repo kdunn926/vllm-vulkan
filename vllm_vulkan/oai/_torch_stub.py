@@ -29,10 +29,11 @@ class / annotation / dtype, is coercible to int/float/str, and exposes a pydanti
 carry a real dotted ``__str__`` (``"torch.bfloat16"``) so transformers' config
 repr (`str(config.dtype).split(".")[1]`) works with no monkeypatch.
 """
-import sys as _sys
-import types as _types
+
 import importlib.abc as _iabc
 import importlib.machinery as _imach
+import sys as _sys
+import types as _types
 
 __version__ = "2.11.0"
 _BIG = (1 << 63) - 1
@@ -126,8 +127,15 @@ class _M(_types.ModuleType):
 # permissive stub keeps `import vllm.entrypoints.openai.api_server` working while
 # the actual guided-decoding path is simply unused (Rust owns generation).
 _ROOTS = (
-    "torch", "llguidance", "xgrammar", "outlines", "outlines_core",
-    "lm_format_enforcer", "lark", "flashinfer", "gguf",
+    "torch",
+    "llguidance",
+    "xgrammar",
+    "outlines",
+    "outlines_core",
+    "lm_format_enforcer",
+    "lark",
+    "flashinfer",
+    "gguf",
 )
 
 
@@ -150,11 +158,10 @@ _sys.meta_path.insert(0, _Finder())
 
 
 # torch symbols referenced by name on the frontend chain.
-class Tensor(metaclass=_AnyMeta):
-    ...
+class Tensor(metaclass=_AnyMeta): ...
 
 
-class dtype:
+class dtype:  # noqa: N801 -- must match real torch.dtype's name; this IS the torch stub
     """Plain class (NOT _AnyMeta) so instances construct normally and carry a
     real dotted __str__ that transformers' `dict_dtype_to_str` splits on."""
 
@@ -167,9 +174,8 @@ class dtype:
     __repr__ = __str__
 
 
-class device:
-    def __init__(self, *a, **k):
-        ...
+class device:  # noqa: N801 -- must match real torch.device's name; this IS the torch stub
+    def __init__(self, *a, **k): ...
 
 
 float32 = dtype("float32")

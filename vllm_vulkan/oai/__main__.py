@@ -16,6 +16,7 @@ model. Confirm token-for-token against `python -m vllm_vulkan.server` on a node
 before relying on it. Without a GPU/_rs (e.g. CI), use `build_app(model)` with the
 default DummyRustBackend instead.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,12 +28,15 @@ from .backend import VulkanRustBackend
 def _load_vulkan_backend_factory(model: str, max_seq_len: int, device_idx: int):
     """Return a backend_factory(tokenizer) -> VulkanRustBackend that loads the
     Vulkan model ONCE (single-stream MVP, max_num_seqs=1)."""
+
     def factory(_tokenizer):
-        from vllm_vulkan.server import find_safetensors
         from vllm_vulkan._rs import VulkanModel
+        from vllm_vulkan.server import find_safetensors
+
         st_path = find_safetensors(model)
         vk_model = VulkanModel(st_path, max_seq_len=max_seq_len, device_idx=device_idx)
         return VulkanRustBackend(vk_model)
+
     return factory
 
 
@@ -44,19 +48,28 @@ def main() -> None:
     ap.add_argument("--max-seq-len", type=int, default=8192)
     ap.add_argument("--device-idx", type=int, default=0)
     ap.add_argument("--served-model-name", default=None)
-    ap.add_argument("--model-type", default="qwen2",
-                    help="hf_config.model_type for the config stub (must != gpt_oss)")
-    ap.add_argument("--trust-remote-code", action="store_true",
-                    help="OPT-IN (default OFF): allow the model repo's custom tokenizer "
-                         "code to execute during tokenizer load (needed for models like "
-                         "Kimi with a TikToken tokenizer). Only for models you TRUST. Can "
-                         "also be scoped per-model via VLLM_VULKAN_TRUST_REMOTE_CODE.")
+    ap.add_argument(
+        "--model-type",
+        default="qwen2",
+        help="hf_config.model_type for the config stub (must != gpt_oss)",
+    )
+    ap.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="OPT-IN (default OFF): allow the model repo's custom tokenizer "
+        "code to execute during tokenizer load (needed for models like "
+        "Kimi with a TikToken tokenizer). Only for models you TRUST. Can "
+        "also be scoped per-model via VLLM_VULKAN_TRUST_REMOTE_CODE.",
+    )
     args = ap.parse_args()
 
     serve(
         args.model,
-        backend_factory=_load_vulkan_backend_factory(args.model, args.max_seq_len, args.device_idx),
-        host=args.host, port=args.port,
+        backend_factory=_load_vulkan_backend_factory(
+            args.model, args.max_seq_len, args.device_idx
+        ),
+        host=args.host,
+        port=args.port,
         served_model_name=args.served_model_name,
         max_model_len=args.max_seq_len,
         model_type=args.model_type,

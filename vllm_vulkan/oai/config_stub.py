@@ -15,7 +15,10 @@ encoder in Rust and keep this False (see README.md).
 This is version-coupled to vLLM's internal renderer/serving surface (NOT public
 API). Pin the vLLM version; re-run the validation gate on any bump.
 """
+
 from __future__ import annotations
+
+from typing import Any
 
 
 class _HFConfig:
@@ -53,21 +56,21 @@ class RustModelConfig:
         self.skip_tokenizer_init = False
         # gating flags that keep torch / multimodal branches OFF
         self.is_encoder_decoder = False
-        self.is_multimodal_model = False        # <-- the critical torch gate
+        self.is_multimodal_model = False  # <-- the critical torch gate
         self.enable_prompt_embeds = False
         # values read directly by renderer / serving
         self.max_model_len = max_model_len
-        self.renderer_num_workers = 1           # sizes the tokenizer thread pool
+        self.renderer_num_workers = 1  # sizes the tokenizer thread pool
         self.hf_config = _HFConfig(model_type)
         self.hf_text_config = _HFConfig(model_type)
         self.multimodal_config = None
-        self.encoder_config = None              # renderer default_chat_tok_params
-        self.allowed_local_media_path = None    # chat_utils media parser
+        self.encoder_config = None  # renderer default_chat_tok_params
+        self.allowed_local_media_path = None  # chat_utils media parser
         self.allowed_media_domains = None
         self.lora_config = None
         # serving layer reads these for default sampling / generation config
         self.generation_config = "auto"
-        self.override_generation_config = {}
+        self.override_generation_config: dict[str, Any] = {}
 
     def get_diff_sampling_param(self) -> dict:
         return {}

@@ -57,7 +57,10 @@ def dump_vulkan(model_dir: str, token_ids: list[int]) -> dict:
     max_seq = max(len(token_ids) + 8, 64)
     model = VulkanModel(st, max_seq_len=max_seq, device_idx=0)
     layers, logits = model.debug_qwen_sequence([int(t) for t in token_ids])
-    return {"layers": [list(map(float, l)) for l in layers], "logits": list(map(float, logits))}
+    return {
+        "layers": [list(map(float, layer)) for layer in layers],
+        "logits": list(map(float, logits)),
+    }
 
 
 def dump_reference_hf(model_dir: str, token_ids: list[int]) -> dict:

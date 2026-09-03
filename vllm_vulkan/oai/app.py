@@ -33,11 +33,13 @@ When OFF (default) behavior is unchanged: base vLLM's safe default runs and a
 custom-tokenizer model errors clearly. When ON, a prominent WARNING is logged
 naming the model whose repo code will execute. ONLY enable for models you trust.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 from collections.abc import Callable
+from typing import Any
 
 from .backend import DummyRustBackend, RustBackend
 from .config_stub import RustModelConfig, RustVllmConfig
@@ -53,7 +55,8 @@ def _warn_remote_code(model: str, source: str) -> None:
         "SECURITY: trust_remote_code is ON for model '%s' (enabled via %s). "
         "Model-repo Python WILL be executed in-process while loading the "
         "tokenizer/config. Only enable this for models you trust.",
-        model, source,
+        model,
+        source,
     )
 
 
@@ -91,11 +94,15 @@ def resolve_trust_remote_code(model: str, cli_flag: bool = False) -> bool:
         return True
     trusted = [t.strip() for t in raw.split(",") if t.strip()]
     if _model_in_scope(model, trusted):
-        _warn_remote_code(model, "env VLLM_VULKAN_TRUST_REMOTE_CODE (scoped allow-list)")
+        _warn_remote_code(
+            model, "env VLLM_VULKAN_TRUST_REMOTE_CODE (scoped allow-list)"
+        )
         return True
     logger.info(
         "trust_remote_code stays OFF for model '%s': not in the "
-        "VLLM_VULKAN_TRUST_REMOTE_CODE allow-list %s.", model, trusted,
+        "VLLM_VULKAN_TRUST_REMOTE_CODE allow-list %s.",
+        model,
+        trusted,
     )
     return False
 
@@ -109,7 +116,7 @@ def build_app(
     model_type: str = "qwen2",
     response_role: str = "assistant",
     trust_remote_code: bool = False,
-    clock_manager: object | None = None,
+    clock_manager: Any | None = None,
     clock_fanout: Callable[[bool], None] | None = None,
 ):
     """Build the FastAPI app.
@@ -129,15 +136,19 @@ def build_app(
     disable when an external owner (nrun / a benchmark) already holds the clock.
     """
     from fastapi import FastAPI
-    from vllm.tokenizers.hf import CachedHfTokenizer
+    from vllm.entrypoints.openai.chat_completion.api_router import (
+        attach_router as chat_router,
+    )
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.api_router import (
+        attach_router as cmpl_router,
+    )
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
     from vllm.renderers.hf import HfRenderer
     from vllm.renderers.online_renderer import OnlineRenderer
-    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-    from vllm.entrypoints.openai.models.protocol import BaseModelPath
-    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-    from vllm.entrypoints.openai.chat_completion.api_router import attach_router as chat_router
-    from vllm.entrypoints.openai.completion.api_router import attach_router as cmpl_router
+    from vllm.tokenizers.hf import CachedHfTokenizer
 
     served = served_model_name or model
     trust = resolve_trust_remote_code(model, cli_flag=trust_remote_code)
@@ -146,21 +157,33 @@ def build_app(
     tok_kwargs = {"trust_remote_code": True} if trust else {}
     tokenizer = CachedHfTokenizer.from_pretrained(model, **tok_kwargs)
     model_config = RustModelConfig(
-        model, served_model_name=served, max_model_len=max_model_len, model_type=model_type,
+        model,
+        served_model_name=served,
+        max_model_len=max_model_len,
+        model_type=model_type,
         trust_remote_code=trust,
     )
     vllm_config = RustVllmConfig(model_config)
 
     renderer = HfRenderer(vllm_config, tokenizer)
     online = OnlineRenderer(
-        model_config=model_config, renderer=renderer, request_logger=None,
-        chat_template=None, chat_template_content_format="auto",
-        trust_request_chat_template=False, enable_auto_tools=False,
-        tool_parser=None, reasoning_parser=None, default_chat_template_kwargs=None,
+        model_config=model_config,
+        renderer=renderer,
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+        trust_request_chat_template=False,
+        enable_auto_tools=False,
+        tool_parser=None,
+        reasoning_parser=None,
+        default_chat_template_kwargs=None,
     )
 
-    backend = (backend_factory(tokenizer) if backend_factory is not None
-               else DummyRustBackend(tokenizer))
+    backend = (
+        backend_factory(tokenizer)
+        if backend_factory is not None
+        else DummyRustBackend(tokenizer)
+    )
 
     # Serving clock manager: active-pin the GPU while requests are in flight, idle-
     # revert after a timeout (the ~45% serve-latency lever). Explicit one wins;
@@ -170,16 +193,17 @@ def build_app(
         try:
             from .clock_manager import ClockManager
         except ImportError:
-            # Clock management is an optional, platform-specific add-on (it pins a
-            # GPU governor). When the module is absent the serve path simply runs
-            # without it — nothing else depends on a live manager.
-            ClockManager = None
+            ClockManager = None  # noqa: N806 -- reused as a class reference, not a variable
+        # Clock management is an optional, platform-specific add-on (it pins a
+        # GPU governor). When the module is absent the serve path simply runs
+        # without it — nothing else depends on a live manager.
         if ClockManager is not None:
             clock_manager = ClockManager.from_env(fanout=clock_fanout)
     if clock_manager is not None:
         clock_manager.install_process_handlers()
-    engine = RustEngineClient(vllm_config, renderer, backend, tokenizer,
-                              clock_manager=clock_manager)
+    engine = RustEngineClient(
+        vllm_config, renderer, backend, tokenizer, clock_manager=clock_manager
+    )
 
     models = OpenAIServingModels(
         engine_client=engine,
@@ -187,14 +211,25 @@ def build_app(
         lora_modules=None,
     )
     chat = OpenAIServingChat(
-        engine, models, response_role, online_renderer=online, request_logger=None,
-        chat_template=None, chat_template_content_format="auto",
-        trust_request_chat_template=False, return_tokens_as_token_ids=False,
-        reasoning_parser="", enable_auto_tools=False, tool_parser=None,
+        engine,
+        models,
+        response_role,
+        online_renderer=online,
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+        trust_request_chat_template=False,
+        return_tokens_as_token_ids=False,
+        reasoning_parser="",
+        enable_auto_tools=False,
+        tool_parser=None,
     )
     chat.warmup()
     cmpl = OpenAIServingCompletion(
-        engine, models, online_renderer=online, request_logger=None,
+        engine,
+        models,
+        online_renderer=online,
+        request_logger=None,
         return_tokens_as_token_ids=False,
     )
 
@@ -232,5 +267,6 @@ def serve(
     **build_kwargs,
 ) -> None:
     import uvicorn
+
     app = build_app(model, backend_factory, **build_kwargs)
     uvicorn.run(app, host=host, port=port)

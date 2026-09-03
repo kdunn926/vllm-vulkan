@@ -25,6 +25,7 @@ left to you. The decode loop below mirrors server.py's proven single-token path;
 verify token-for-token against the standalone server on a real GPU before relying
 on it.
 """
+
 from __future__ import annotations
 
 import random
@@ -36,8 +37,9 @@ from typing import Protocol, runtime_checkable
 @dataclass
 class Step:
     """One decode step from the backend."""
+
     token_id: int
-    done: bool = False   # backend-side natural end (e.g. it hit an internal cap)
+    done: bool = False  # backend-side natural end (e.g. it hit an internal cap)
 
 
 @runtime_checkable
@@ -100,6 +102,7 @@ class VulkanRustBackend:
         # prefill every stream, byte-identical to the legacy path).
         if session is None:
             from ..session_kv import SessionKvManager
+
             session = SessionKvManager(model)
         self._session = session
 
@@ -132,7 +135,9 @@ class VulkanRustBackend:
         # exactly as server.py does (note: Math.random-free constraint applies to
         # WORKFLOW scripts, not to this runtime module).
         while True:
-            nxt = m.forward_and_sample(cur, pos, temperature, top_p, top_k, random.random())
+            nxt = m.forward_and_sample(
+                cur, pos, temperature, top_p, top_k, random.random()
+            )
             yield Step(token_id=int(nxt), done=False)
             # `cur` was just forwarded at `pos` (advancing the KV); record it as
             # resident so a follow-up same-session stream can continue past it.
@@ -162,8 +167,8 @@ class DistributedVulkanRustBackend:
     """
 
     def __init__(self, head, sampler=None):
-        self._head = head          # DistHead (duck-typed: .prefill/.decode)
-        self._sampler = sampler    # optional callable([vocab], sampling_params)->int
+        self._head = head  # DistHead (duck-typed: .prefill/.decode)
+        self._sampler = sampler  # optional callable([vocab], sampling_params)->int
 
     def _sample(self, logits, sampling_params):
         if self._sampler is not None:
@@ -172,16 +177,17 @@ class DistributedVulkanRustBackend:
         bi, bv = 0, float("-inf")
         for i, v in enumerate(logits):
             if v > bv:
-                bv = v; bi = i
+                bv = v
+                bi = i
         return bi
 
     async def stream(
         self, prompt_token_ids: list[int], sampling_params
     ) -> AsyncIterator[Step]:
         head = self._head
-        logits = head.prefill(list(prompt_token_ids))   # distributed prefill -> [vocab]
+        logits = head.prefill(list(prompt_token_ids))  # distributed prefill -> [vocab]
         cur = self._sample(logits, sampling_params)
         while True:
             yield Step(token_id=int(cur), done=False)
-            logits = head.decode(cur)                    # one distributed decode step
+            logits = head.decode(cur)  # one distributed decode step
             cur = self._sample(logits, sampling_params)
