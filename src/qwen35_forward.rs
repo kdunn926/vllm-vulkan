@@ -1282,7 +1282,7 @@ impl VulkanModel {
         let post_ln = self.qwen35_w(&ln("post_attention_layernorm.weight"));
         let ff_in = model::cpu_rms_norm(&h1, &post_ln, eps);
         let tm = std::time::Instant::now();
-        let mlp_out = if cfg.is_moe() {
+        let mlp_out = if cfg.layer_is_moe(layer_idx) {
             self.qwen35_moe_mlp_gpu(cfg, layer_idx, &ff_in)
         } else {
             self.qwen35_dense_mlp_gpu(cfg, layer_idx, &ff_in)
@@ -3584,7 +3584,7 @@ impl VulkanModel {
             let residual2 = h1.clone();
             let post_ln = self.qwen35_w(&ln("post_attention_layernorm.weight"));
             let ff_in = model::cpu_rms_norm(&h1, &post_ln, eps);
-            let mlp_out = if cfg.is_moe() {
+            let mlp_out = if cfg.layer_is_moe(layer_idx) {
                 // MoE: grouped MUL_MAT_ID GEMM handles its own T-batching — the
                 // cols flag stays OFF here (never routes experts through cols).
                 self.qwen35_moe_mlp_prefill_gpu(&cfg, layer_idx, &ff_in, t)
@@ -3776,7 +3776,7 @@ impl VulkanModel {
             let residual2 = h1.clone();
             let post_ln = self.qwen35_w(&ln("post_attention_layernorm.weight"));
             let ff_in = model::cpu_rms_norm(&h1, &post_ln, eps);
-            let mlp_out = if cfg.is_moe() {
+            let mlp_out = if cfg.layer_is_moe(layer_idx) {
                 self.qwen35_moe_mlp_prefill_gpu(&cfg, layer_idx, &ff_in, t)
             } else {
                 self.qwen35_dense_mlp_prefill_gpu(&cfg, layer_idx, &ff_in, t)
@@ -4620,6 +4620,17 @@ impl VulkanModel {
         if !cfg.is_moe() || cfg.num_experts_per_tok != 8 {
             return false;
         }
+        // The resident recording assumes EVERY resident layer is MoE (it reads
+        // `moe_shared_gpu[layer]` unconditionally). A config that makes some
+        // layers dense (`mlp_only_layers` / `decoder_sparse_step`) must take the
+        // per-block path, which branches per layer. No roster checkpoint does
+        // this, so the resident path is unaffected today.
+        if (self.pp_start..self.pp_end).any(|l| !cfg.layer_is_moe(l)) {
+            log::warn!("qwen3_5 resident stage: layers [{}, {}) are not all MoE \
+                        (mlp_only_layers / decoder_sparse_step); using the per-block path",
+                       self.pp_start, self.pp_end);
+            return false;
+        }
         for layer_idx in self.pp_start..self.pp_end {
             match cfg.layer_types[layer_idx] {
                 qwen35::LayerType::LinearAttention => {
@@ -5212,6 +5223,17 @@ impl VulkanModel {
     /// tables (q35_f16_host). This is the parity baseline vs forward_qwen35_gpu;
     /// it shares `layer_state` so decode-step state persists across both paths.
     pub(crate) fn forward_qwen35_cpu_ref(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
+        // The lm_head f16 table is read only after `forward_layers_from_hidden`
+        // has advanced the KV / GDN state, and this fn returns a plain Vec (no
+        // Err channel) — so PANIC EARLY with a named message while nothing has
+        // moved, instead of aborting mid-forward through the pyo3 boundary.
+        // Callers are the debug/parity seams; a missing table is a wiring bug.
+        {
+            let lm_name = self.qwen35.as_ref().unwrap().lm_head_name.clone();
+            assert!(self.q35_f16_host.contains_key(&lm_name),
+                "forward_qwen35_cpu_ref: qwen3_5 lm_head f16 host missing ('{lm_name}') \
+                 — checked before the forward advances any state");
+        }
         let cfg = self.qwen35.as_ref().unwrap().config.clone();
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;

@@ -93,7 +93,11 @@ pub fn route_from_logits(logits: &[f32], top_k: usize, norm_topk_prob: bool) -> 
     let mut indices: Vec<usize> = order[..top_k].to_vec();
     indices.sort_unstable();
     let sel: Vec<f32> = indices.iter().map(|&i| gates[i]).collect();
-    let scores: Vec<f32> = if norm_topk_prob {
+    // HF renormalises only when there is more than one selected expert
+    // (`norm_topk_prob and top_k > 1` in `Qwen3_5MoeTopKRouter`): at top_k == 1
+    // the division would force the single score to exactly 1.0 and discard the
+    // router's confidence, which the reference keeps.
+    let scores: Vec<f32> = if norm_topk_prob && top_k > 1 {
         let sum: f32 = sel.iter().sum();
         sel.iter().map(|&s| if sum > 0.0 { s / sum } else { 0.0 }).collect()
     } else {
@@ -466,4 +470,31 @@ mod router_tests {
         let sum_off: f32 = off.scores.iter().sum();
         assert!(sum_off < 1.0, "raw top-2 gates of 5 experts sum below 1; got {sum_off}");
     }
+
+#[cfg(test)]
+mod topk1_tests {
+    use super::*;
+
+    /// At `top_k == 1` HF does NOT renormalise (`norm_topk_prob and top_k > 1`):
+    /// dividing by the single score would force it to exactly 1.0 and discard the
+    /// router's confidence.
+    #[test]
+    fn route_from_logits_at_top_k_1_keeps_the_raw_gate() {
+        let logits = [0.0f32, 2.0, 1.0];
+        let r = route_from_logits(&logits, 1, true);
+        assert_eq!(r.indices, vec![1]);
+        let g = softmax(&logits)[1];
+        assert!((r.scores[0] - g).abs() < 1e-7,
+                "top_k==1 must keep the raw gate {g}, got {}", r.scores[0]);
+        assert!(r.scores[0] < 0.99, "a renormalised single score would be 1.0");
+        // top_k > 1 still renormalises to sum 1
+        let r2 = route_from_logits(&logits, 2, true);
+        let sum: f32 = r2.scores.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "top_k>1 renormalises, sum={sum}");
+        // and norm_topk_prob=false is untouched at any k
+        let r3 = route_from_logits(&logits, 2, false);
+        let s3: f32 = r3.scores.iter().sum();
+        assert!(s3 < 1.0, "unnormalised scores must not sum to 1 here: {s3}");
+    }
+}
 }

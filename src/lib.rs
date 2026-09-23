@@ -9442,6 +9442,8 @@ pub(crate) mod qwen35_prefill_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         }
     }
 
@@ -9859,6 +9861,8 @@ mod kv_cache_pymethod_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types,
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let weights = model::ModelWeights { tensors: HashMap::new() };
         Qwen35Model::new(cfg, weights, max_seq_len, "unused".to_string())

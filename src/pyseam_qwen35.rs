@@ -543,6 +543,15 @@ impl VulkanModel {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_qwen35_window: hidden_in len {} != t*hidden {}", hidden_in.len(), t * h)));
         }
+        // The lm_head table is read only AFTER `forward_pp_range_batched` has
+        // advanced the resident KV / GDN state, so check it here while nothing
+        // has moved — the same hoist `forward_qwen35_prefill_impl` does.
+        let lm_name = self.qwen35.as_ref().unwrap().lm_head_name.clone();
+        if pp_last && !self.q35_f16_host.contains_key(&lm_name) {
+            return Err(PyRuntimeError::new_err(format!(
+                "forward_qwen35_window: qwen3_5 lm_head f16 host missing \
+                 (streaming oracle last window, '{lm_name}')")));
+        }
         let qm = self.qwen35.as_mut().unwrap();
         let hidden = qm.forward_pp_range_batched(&hidden_in, start_pos, t, pp_start, pp_end);
         if !pp_last {
@@ -551,7 +560,6 @@ impl VulkanModel {
         // Last window: final norm + lm_head on the last position (mirrors the
         // CPU-fallback last-stage in forward_qwen35_prefill_impl).
         let norm_w = qm.weights.f32_slice("model.norm.weight").to_vec();
-        let lm_name = qm.lm_head_name.clone();
         let last = &hidden[(t - 1) * h..t * h];
         let normed = model::cpu_rms_norm(last, &norm_w, eps);
         let lm_w = self.q35_f16_host.get(&lm_name)
@@ -621,6 +629,11 @@ impl VulkanModel {
         if t == 0 {
             return Err(PyRuntimeError::new_err("debug_qwen35_verify_vs_serial: empty tokens"));
         }
+        // Validate EVERY token up front: the serial loop below advances the
+        // resident state per position, so a bad id at index i>0 would leave
+        // positions 0..i-1 already advanced (the harness restores from the
+        // snapshot, but only after a successful loop).
+        self.q35_check_tokens("debug_qwen35_verify_vs_serial", &tokens)?;
         // Snapshot resident state at start_pos into a scratch ring slot.
         self.spec_snapshot_impl(0).map_err(PyRuntimeError::new_err)?;
         // Serial reference: single-token forward per position (advances state).
@@ -799,6 +812,11 @@ impl VulkanModel {
         if t == 0 {
             return Err(PyRuntimeError::new_err("debug_tp_qwen35_verify_vs_serial: empty tokens"));
         }
+        // Validate EVERY token up front: the serial loop below advances the
+        // resident state per position, so a bad id at index i>0 would leave
+        // positions 0..i-1 already advanced (the harness restores from the
+        // snapshot, but only after a successful loop).
+        self.q35_check_tokens("debug_tp_qwen35_verify_vs_serial", &tokens)?;
         // Snapshot the resident (sharded) state at start_pos into scratch slot 0.
         self.spec_snapshot_impl(0).map_err(PyRuntimeError::new_err)?;
         // Serial reference: single-token TP forward per position (advances the

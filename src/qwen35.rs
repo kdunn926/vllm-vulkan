@@ -126,11 +126,28 @@ pub struct Qwen35Config {
 
     /// Per-layer attention kind (length == num_hidden_layers).
     pub layer_types: Vec<LayerType>,
+
+    /// Layers that use the DENSE MLP even on a MoE model (HF
+    /// `mlp_only_layers`). Empty on every checkpoint in the roster.
+    pub mlp_only_layers: Vec<usize>,
+    /// MoE layer stride (HF `decoder_sparse_step`): a layer is MoE when
+    /// `(idx + 1) % decoder_sparse_step == 0`. Default 1 = every layer.
+    pub decoder_sparse_step: usize,
 }
 
 impl Qwen35Config {
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0 && self.num_experts_per_tok > 0
+    }
+
+    /// Does layer `idx` use the MoE MLP? Mirrors HF `Qwen3_5MoeDecoderLayer`:
+    /// a MoE model uses the dense MLP on a layer named in `mlp_only_layers`, and
+    /// otherwise only on every `decoder_sparse_step`-th layer. Both default so
+    /// that every layer of a MoE model is MoE (the roster's behaviour today).
+    pub fn layer_is_moe(&self, idx: usize) -> bool {
+        self.is_moe()
+            && !self.mlp_only_layers.contains(&idx)
+            && (idx + 1) % self.decoder_sparse_step.max(1) == 0
     }
 
     pub fn key_dim(&self) -> usize {
@@ -223,16 +240,36 @@ impl Qwen35Config {
         }
         let head_dim = u("head_dim").unwrap_or(hidden_size / num_attention_heads);
 
-        let layer_types: Vec<LayerType> = tc["layer_types"]
+        let n_layers: usize = req("num_hidden_layers")?;
+        // `layer_types` is the explicit schedule. When it is absent (the
+        // Qwen3-Next-style configs that state only the interval) derive it:
+        // every `full_attention_interval`-th layer is full attention, the rest
+        // are linear — the same rule `Qwen3NextConfig` applies, default 4.
+        let layer_types: Vec<LayerType> = match tc["layer_types"].as_array() {
+            Some(a) => a
+                .iter()
+                .map(|s| match s.as_str() {
+                    Some("full_attention") => Ok(LayerType::FullAttention),
+                    Some("linear_attention") => Ok(LayerType::LinearAttention),
+                    other => Err(format!("unknown layer_type {other:?}")),
+                })
+                .collect::<Result<_, _>>()?,
+            None => {
+                let interval = u("full_attention_interval").unwrap_or(4).max(1);
+                (0..n_layers)
+                    .map(|i| if (i + 1) % interval == 0 {
+                        LayerType::FullAttention
+                    } else {
+                        LayerType::LinearAttention
+                    })
+                    .collect()
+            }
+        };
+        let mlp_only_layers: Vec<usize> = tc["mlp_only_layers"]
             .as_array()
-            .ok_or("config.json missing 'layer_types'")?
-            .iter()
-            .map(|s| match s.as_str() {
-                Some("full_attention") => Ok(LayerType::FullAttention),
-                Some("linear_attention") => Ok(LayerType::LinearAttention),
-                other => Err(format!("unknown layer_type {other:?}")),
-            })
-            .collect::<Result<_, _>>()?;
+            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect())
+            .unwrap_or_default();
+        let decoder_sparse_step = u("decoder_sparse_step").unwrap_or(1).max(1);
 
         let rope = tc.get("rope_parameters").unwrap_or(tc);
         let rope_theta = rope["rope_theta"].as_f64().unwrap_or(10_000_000.0) as f32;
@@ -241,7 +278,7 @@ impl Qwen35Config {
 
         let cfg = Qwen35Config {
             hidden_size,
-            num_hidden_layers: req("num_hidden_layers")?,
+            num_hidden_layers: n_layers,
             vocab_size: req("vocab_size")?,
             rms_norm_eps: tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             tie_word_embeddings: v["tie_word_embeddings"]
@@ -266,6 +303,8 @@ impl Qwen35Config {
             shared_expert_intermediate_size: u("shared_expert_intermediate_size").unwrap_or(0),
             norm_topk_prob: tc["norm_topk_prob"].as_bool().unwrap_or(true),
             layer_types,
+            mlp_only_layers,
+            decoder_sparse_step,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -364,6 +403,8 @@ pub fn synthetic_hybrid_qwen35(
         shared_expert_intermediate_size: 0,
         norm_topk_prob: true,
         layer_types: layer_types.clone(),
+        mlp_only_layers: Vec::new(),
+        decoder_sparse_step: 1,
     };
 
     // Deterministic LCG seeded from tag + index
@@ -1080,7 +1121,7 @@ impl Qwen35Model {
             let residual2 = h1.clone();
             let post_ln = self.w(&ln("post_attention_layernorm.weight"));
             let ff_in = cpu_rms_norm(&h1, &post_ln, eps);
-            let mlp_out = if cfg.is_moe() {
+            let mlp_out = if cfg.layer_is_moe(layer_idx) {
                 self.moe_mlp(layer_idx, &ff_in)
             } else {
                 self.dense_mlp(layer_idx, &ff_in)
@@ -1173,7 +1214,7 @@ impl Qwen35Model {
                 let mut out = vec![0.0f32; t_count * h];
                 for ti in 0..t_count {
                     let fi = &ff_in[ti * h..(ti + 1) * h];
-                    let o = if cfg.is_moe() { self.moe_mlp(layer_idx, fi) } else { self.dense_mlp(layer_idx, fi) };
+                    let o = if cfg.layer_is_moe(layer_idx) { self.moe_mlp(layer_idx, fi) } else { self.dense_mlp(layer_idx, fi) };
                     out[ti * h..(ti + 1) * h].copy_from_slice(&o);
                 }
                 out
@@ -1764,6 +1805,8 @@ mod spec_rollback_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let key_dim = nk * kd;
         let value_dim = nv * vd;
@@ -2089,6 +2132,8 @@ pub(crate) mod kv_prefix_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types,
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let weights = ModelWeights { tensors: HashMap::new() };
         Qwen35Model::new(cfg, weights, 64, "unused".to_string())
@@ -2377,6 +2422,8 @@ pub(crate) mod kv_prefix_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let key_dim = nk * kd;
         let value_dim = nv * vd;
@@ -2465,6 +2512,74 @@ pub(crate) mod kv_prefix_tests {
     /// (the prefix-cache round-trip gate) but for the RESIDENT (no export/import)
     /// continuation path.
     #[test]
+    /// `layer_types` absent -> derive the schedule from `full_attention_interval`
+    /// (default 4), the Qwen3-Next rule, instead of erroring.
+    #[test]
+    fn from_json_derives_layer_types_from_the_interval() {
+        let base = |extra: &str| format!(r#"{{
+            "text_config": {{
+              "hidden_size": 32, "num_hidden_layers": 8, "vocab_size": 64,
+              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+              "linear_num_key_heads": 1, "linear_num_value_heads": 2,
+              "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "intermediate_size": 64
+              {extra}
+            }} }}"#);
+        // no layer_types, no interval -> every 4th layer is full attention
+        let c = Qwen35Config::from_json(&serde_json::from_str::<serde_json::Value>(&base("")).unwrap()).expect("parse");
+        let kinds: Vec<bool> = c.layer_types.iter()
+            .map(|t| matches!(t, LayerType::FullAttention)).collect();
+        assert_eq!(kinds, vec![false, false, false, true, false, false, false, true]);
+        // explicit interval 2
+        let c = Qwen35Config::from_json(&serde_json::from_str::<serde_json::Value>(&base(", \"full_attention_interval\": 2")).unwrap()).expect("parse");
+        let kinds: Vec<bool> = c.layer_types.iter()
+            .map(|t| matches!(t, LayerType::FullAttention)).collect();
+        assert_eq!(kinds, vec![false, true, false, true, false, true, false, true]);
+        // an explicit layer_types list still wins
+        let c = Qwen35Config::from_json(&serde_json::from_str::<serde_json::Value>(&base(
+            ", \"layer_types\": [\"full_attention\",\"linear_attention\",\"linear_attention\",\
+             \"linear_attention\",\"linear_attention\",\"linear_attention\",\"linear_attention\",\
+             \"linear_attention\"]")).unwrap()).expect("parse");
+        assert!(matches!(c.layer_types[0], LayerType::FullAttention));
+        assert!(matches!(c.layer_types[1], LayerType::LinearAttention));
+    }
+
+    /// `mlp_only_layers` / `decoder_sparse_step` gate the MoE MLP per layer; the
+    /// defaults keep every layer of a MoE model MoE (today's behaviour).
+    #[test]
+    fn layer_is_moe_honours_mlp_only_layers_and_sparse_step() {
+        let mk = |extra: &str| Qwen35Config::from_json(&serde_json::from_str::<serde_json::Value>(&format!(r#"{{
+            "text_config": {{
+              "hidden_size": 32, "num_hidden_layers": 4, "vocab_size": 64,
+              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+              "linear_num_key_heads": 1, "linear_num_value_heads": 2,
+              "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "moe_intermediate_size": 16,
+              "num_experts": 8, "num_experts_per_tok": 2,
+              "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"]
+              {extra}
+            }} }}"#)).unwrap()).expect("parse");
+        let c = mk("");
+        assert!((0..4).all(|i| c.layer_is_moe(i)), "default: every layer MoE");
+        let c = mk(", \"mlp_only_layers\": [1, 2]");
+        assert_eq!((0..4).map(|i| c.layer_is_moe(i)).collect::<Vec<_>>(),
+                   vec![true, false, false, true]);
+        let c = mk(", \"decoder_sparse_step\": 2");
+        assert_eq!((0..4).map(|i| c.layer_is_moe(i)).collect::<Vec<_>>(),
+                   vec![false, true, false, true]);
+        // a dense model is never per-layer MoE
+        let dense = Qwen35Config::from_json(&serde_json::from_str::<serde_json::Value>(&format!(r#"{{
+            "text_config": {{
+              "hidden_size": 32, "num_hidden_layers": 2, "vocab_size": 64,
+              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+              "linear_num_key_heads": 1, "linear_num_value_heads": 2,
+              "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "intermediate_size": 64,
+              "layer_types": ["linear_attention","full_attention"]
+            }} }}"#)).unwrap()).expect("parse");
+        assert!(!dense.layer_is_moe(0) && !dense.layer_is_moe(1));
+    }
+
     fn session_continuation_matches_full_reprefill() {
         let l = 5usize; // turn-1 resident context length
         let tail = 3usize; // turn-2 appended tokens
@@ -2583,6 +2698,8 @@ mod kv_boundary_snapshot_tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let key_dim = nk * kd;
         let value_dim = nv * vd;

@@ -999,6 +999,8 @@ mod tests {
             shared_expert_intermediate_size: 6,
             norm_topk_prob: true,
             layer_types: vec![LayerType::FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         }
     }
 
@@ -1346,6 +1348,8 @@ mod tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LayerType::FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         }
     }
 

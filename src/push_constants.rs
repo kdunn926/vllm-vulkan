@@ -2857,6 +2857,8 @@ mod dispatch_tests {
             moe_intermediate_size: 0, shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             layer_types: vec![LinearAttention, FullAttention],
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
         };
         let h = cfg.hidden_size;
         let inter = cfg.intermediate_size;

@@ -2515,13 +2515,51 @@ pub(crate) fn resolve_pp_stage_shards_in(
 /// both exports and is excluded. Keyed on the RAW `model.language_model.` HF
 /// nesting so MLX checkpoints (`language_model.model.*`, +1 already baked in —
 /// e.g. the 4bit 27B and the 122B) are untouched.
-fn qwen35_hf_zero_centered_norm(raw_name: &str, name: &str) -> bool {
-    raw_name.starts_with("model.language_model.")
+/// As above, but with the checkpoint-wide HF-flavour verdict supplied by
+/// `qwen35_ckpt_is_hf_flavour` (see there). The prefix test alone MISSES a
+/// TEXT-ONLY HF export (`model.layers.*`, no `language_model` nesting) — that
+/// flavour stores the same zero-centered norms, and loading them raw multiplies
+/// every hidden state by ~0 (structural garbage from token 1, the 2026-07-19
+/// symptom). `hf_flavour` carries the whole-checkpoint evidence so such an
+/// export is offset too.
+fn qwen35_hf_zero_centered_norm_fl(raw_name: &str, name: &str, hf_flavour: bool) -> bool {
+    (raw_name.starts_with("model.language_model.") || hf_flavour)
         && (name.ends_with(".input_layernorm.weight")
             || name.ends_with(".post_attention_layernorm.weight")
             || name.ends_with(".q_norm.weight")
             || name.ends_with(".k_norm.weight")
             || name == "model.norm.weight")
+}
+
+/// Is this qwen3_5 checkpoint an HF-flavour export (zero-centered norms) even
+/// though it is TEXT-ONLY (`model.layers.*`, so the `model.language_model.`
+/// prefix test does not fire)? Two independent signals, either sufficient:
+///   * an `mtp.*` tensor — MLX exports drop the MTP head, HF/modelopt keep it;
+///   * a GDN `conv1d.weight` stored `[C, 1, K]` (HF Conv1d, groups == channels)
+///     rather than MLX's 2-D `[C, K]`.
+/// An MLX-nested name (`language_model.model.*`) or an HF-nested one
+/// (`model.language_model.*`) settles the flavour on its own, so this is only
+/// consulted when neither nesting is present. Conservative by construction: with
+/// no signal it returns false and the loader behaves exactly as before.
+fn qwen35_ckpt_is_hf_flavour<'a, I>(names_and_shapes: I) -> bool
+where
+    I: IntoIterator<Item = (&'a str, &'a [usize])>,
+{
+    let mut nested = false;
+    let mut mtp = false;
+    let mut conv3d = false;
+    for (n, shape) in names_and_shapes {
+        if n.starts_with("language_model.") || n.starts_with("model.language_model.") {
+            nested = true;
+        }
+        if n.starts_with("mtp.") || n.contains(".mtp.") {
+            mtp = true;
+        }
+        if n.ends_with("conv1d.weight") && shape.len() == 3 && shape[1] == 1 {
+            conv3d = true;
+        }
+    }
+    !nested && (mtp || conv3d)
 }
 
 fn normalize_qwen35_name(raw: &str) -> String {
@@ -4238,6 +4276,16 @@ pub fn load_qwen35_weights_split(
     // (+ q8 requant) the last stage would otherwise build — the rank5 OOM lever.
     let mut out_lmhead_packed: Option<PackedEmbed> = None;
     let lmhead_packed_on = q35_lmhead_packed_enabled();
+    // Whole-checkpoint HF-flavour verdict for the zero-centered norms (see
+    // `qwen35_ckpt_is_hf_flavour`): a TEXT-ONLY HF export has no
+    // `model.language_model.` prefix to key on, so the per-name test alone would
+    // load its zero-centered norms raw.
+    let hf_flavour = qwen35_ckpt_is_hf_flavour(
+        order.iter().map(|n| (n.as_str(), entries[n].shape.as_slice())));
+    if hf_flavour {
+        log::info!("qwen3_5 loader: text-only HF-flavour checkpoint detected \
+                    (mtp.* or [C,1,K] conv1d) -> folding +1 into the zero-centered norms");
+    }
     for raw_name in &order {
         // compressed-tensors "nvfp4-pack-quantized" (unsloth Qwen3.8-27B-NVFP4)
         // names the packed NVFP4 mlp weight `<base>.weight_packed` (vs modelopt's
@@ -4511,6 +4559,22 @@ pub fn load_qwen35_weights_split(
             // (GDN/attn) — MoE experts are excluded by the matvec predicate.
             // Sink returns `Dequantize` when the flag is off / no engine ->
             // fall through to the byte-identical dequant below.
+            if name.ends_with(".in_proj_qkvz.weight") || name.ends_with(".in_proj_ba.weight") {
+                // A fused Qwen3-Next in-projection is split by ROW PERMUTATION
+                // (`qwen35_split_fused_qkvz`). Permuting rows of a QUANTIZED
+                // tensor would break the affine group boundaries (the scales are
+                // per (row, group)), so a quantized fused tensor is refused
+                // rather than dequantized-and-reordered into silently wrong
+                // weights. Native Qwen3-Next ships these plain (bf16).
+                if is_quant || is_nvfp4 || is_fp8 {
+                    return Err(format!(
+                        "qwen3_5 loader: '{name}' is a QUANTIZED fused Qwen3-Next \
+                         in-projection. The split needs a row permutation, which \
+                         does not preserve the per-(row, group) scales. Re-export \
+                         the checkpoint with split in_proj_qkv / _z / _a / _b, or \
+                         load an unquantized copy of these two tensors."));
+                }
+            }
             if is_quant && is_qwen35_matvec_weight_name(&name) {
                 let tbits = qwen35_tensor_bits(&name, bits);
                 if tbits == 4 {
@@ -4595,7 +4659,7 @@ pub fn load_qwen35_weights_split(
                 // layernorms, q/k norms and the final `model.norm`, while
                 // `linear_attn.norm` (gated RMSNorm) is bit-identical (plain
                 // in both) and must NOT be offset.
-                if qwen35_hf_zero_centered_norm(raw_name, &name) {
+                if qwen35_hf_zero_centered_norm_fl(raw_name, &name, hf_flavour) {
                     for v in w.iter_mut() {
                         *v += 1.0;
                     }
@@ -4606,7 +4670,55 @@ pub fn load_qwen35_weights_split(
             // returns `Consumed` if it took the tensor (GPU upload + drop),
             // or `KeepF32` to accumulate as f32 (CPU-only mode). MoE tensors
             // are excluded from the matvec predicate -> host f32.
-            if is_qwen35_matvec_weight_name(&name) {
+            // Qwen3-Next NATIVE fused in-projections: split by row permutation
+            // into the four tensors the forward expects, then hand each to the
+            // sink under its own name. `in_proj_ba` is split on its own pass
+            // (both halves are independent of qkvz).
+            if name.ends_with(".in_proj_qkvz.weight") || name.ends_with(".in_proj_ba.weight") {
+                let (hidden_sz, nk, nv, kd, vd) = qwen35_gdn_dims_from_config(path)?;
+                let base = name.trim_end_matches(".in_proj_qkvz.weight")
+                               .trim_end_matches(".in_proj_ba.weight");
+                let (qkv, z, b, a) = if name.ends_with(".in_proj_qkvz.weight") {
+                    qwen35_split_fused_qkvz(&deq, None, hidden_sz, nk, nv, kd, vd)?
+                } else {
+                    // ba-only: pass an empty qkvz of the right length is wasteful;
+                    // split the ba rows directly with the same grouping.
+                    let ratio = if nk == 0 { 0 } else { nv / nk };
+                    if ratio == 0 || deq.len() != 2 * nv * hidden_sz {
+                        return Err(format!(
+                            "fused in_proj_ba '{name}': {} floats, expected {}",
+                            deq.len(), 2 * nv * hidden_sz));
+                    }
+                    let h = hidden_sz;
+                    let mut bb = vec![0.0f32; nv * h];
+                    let mut aa = vec![0.0f32; nv * h];
+                    for g in 0..nk {
+                        let gb = g * 2 * ratio;
+                        for i in 0..ratio {
+                            let d = (g * ratio + i) * h;
+                            bb[d..d + h].copy_from_slice(&deq[(gb + i) * h..(gb + i + 1) * h]);
+                            aa[d..d + h].copy_from_slice(&deq[(gb + ratio + i) * h..(gb + ratio + i + 1) * h]);
+                        }
+                    }
+                    (Vec::new(), Vec::new(), Some(bb), Some(aa))
+                };
+                log::info!("qwen3_5 loader: split fused '{name}' (Qwen3-Next layout)");
+                for (suffix, t) in [("in_proj_qkv", qkv), ("in_proj_z", z)] {
+                    if t.is_empty() { continue; }
+                    let n2 = format!("{base}.{suffix}.weight");
+                    if let ProjResult::KeepF32(v) = on_proj(&n2, ProjWeight::F32(t)) {
+                        out_f32.insert(n2, v);
+                    }
+                }
+                for (suffix, t) in [("in_proj_b", b), ("in_proj_a", a)] {
+                    if let Some(t) = t {
+                        let n2 = format!("{base}.{suffix}.weight");
+                        if let ProjResult::KeepF32(v) = on_proj(&n2, ProjWeight::F32(t)) {
+                            out_f32.insert(n2, v);
+                        }
+                    }
+                }
+            } else if is_qwen35_matvec_weight_name(&name) {
                 if let ProjResult::KeepF32(v) = on_proj(&name, ProjWeight::F32(deq)) {
                     out_f32.insert(name, v);
                 }
@@ -4921,6 +5033,107 @@ fn load_qwen35_moe_quant_experts_pread(
 /// `.gate_proj.weight` / `.up_proj.weight` / `.down_proj.weight`, but they are
 /// NOT dense projection matvecs — they are consumed by the CPU `moe` block and
 /// must stay host f32. They are excluded here via `is_qwen35_moe_weight_name`.
+/// GDN head dims for the fused-projection split, read from the checkpoint's own
+/// `config.json` (sibling of the shard `path`). The loader is arch-agnostic, so
+/// these are not otherwise available to it; this is called ONLY when a fused
+/// `in_proj_qkvz` / `in_proj_ba` tensor actually appears, so every existing
+/// checkpoint pays nothing. Returns `(hidden, nk, nv, kd, vd)`.
+fn qwen35_gdn_dims_from_config(path: &Path) -> Result<(usize, usize, usize, usize, usize), String> {
+    let dir = path.parent().ok_or("shard path has no parent directory")?;
+    let cfgp = dir.join("config.json");
+    let txt = std::fs::read_to_string(&cfgp)
+        .map_err(|e| format!("fused in_proj split needs {}: {e}", cfgp.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&txt)
+        .map_err(|e| format!("{}: {e}", cfgp.display()))?;
+    let tc = v.get("text_config").unwrap_or(&v);
+    let g = |k: &str| -> Result<usize, String> {
+        tc[k].as_u64().map(|x| x as usize).ok_or(format!("{}: missing '{k}'", cfgp.display()))
+    };
+    Ok((g("hidden_size")?, g("linear_num_key_heads")?, g("linear_num_value_heads")?,
+        g("linear_key_head_dim")?, g("linear_value_head_dim")?))
+}
+
+/// Split a Qwen3-Next NATIVE fused GDN in-projection into the four tensors this
+/// loader and forward expect. Qwen3-Next stores
+///   `in_proj_qkvz.weight` [(2*key_dim + 2*value_dim), hidden]  and
+///   `in_proj_ba.weight`   [(2*num_v_heads), hidden]
+/// grouped PER KEY HEAD, not as four concatenated blocks
+/// (`Qwen3NextGatedDeltaNet.fix_query_key_value_ordering`): for each of `nk`
+/// key-head groups the rows run `q(kd) | k(kd) | v(ratio*vd) | z(ratio*vd)`, and
+/// the `ba` rows run `b(ratio) | a(ratio)`. Our tensors are BLOCK-major:
+///   `in_proj_qkv` = [all q | all k | all v]   (2*key_dim + value_dim rows)
+///   `in_proj_z`   = [all z]                   (value_dim rows)
+///   `in_proj_b`, `in_proj_a`                  (num_v_heads rows each)
+/// so the conversion is a row permutation (no arithmetic), applied at load.
+/// `rows` is the row count of the source; each row is `hidden` floats.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen35_split_fused_qkvz(
+    qkvz: &[f32],
+    ba: Option<&[f32]>,
+    hidden: usize,
+    nk: usize,
+    nv: usize,
+    kd: usize,
+    vd: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>), String> {
+    if nk == 0 || nv % nk != 0 {
+        return Err(format!(
+            "fused in_proj_qkvz: linear_num_value_heads {nv} is not a multiple of \
+             linear_num_key_heads {nk}"));
+    }
+    let ratio = nv / nk;
+    let (key_dim, value_dim) = (nk * kd, nv * vd);
+    let per_group = 2 * kd + 2 * ratio * vd;
+    let want = per_group * nk * hidden;
+    if qkvz.len() != want {
+        return Err(format!(
+            "fused in_proj_qkvz: {} floats, expected {want} \
+             (nk {nk} × (2×{kd} + 2×{ratio}×{vd}) rows × hidden {hidden})",
+            qkvz.len()));
+    }
+    let mut qkv = vec![0.0f32; (2 * key_dim + value_dim) * hidden];
+    let mut z = vec![0.0f32; value_dim * hidden];
+    fn row(src: &[f32], r: usize, hidden: usize) -> &[f32] { &src[r * hidden..(r + 1) * hidden] }
+    for g in 0..nk {
+        let base = g * per_group;
+        for i in 0..kd {
+            // q -> [0, key_dim)                k -> [key_dim, 2*key_dim)
+            let q_dst = (g * kd + i) * hidden;
+            qkv[q_dst..q_dst + hidden].copy_from_slice(row(qkvz, base + i, hidden));
+            let k_dst = (key_dim + g * kd + i) * hidden;
+            qkv[k_dst..k_dst + hidden].copy_from_slice(row(qkvz, base + kd + i, hidden));
+        }
+        for i in 0..ratio * vd {
+            // v -> [2*key_dim, 2*key_dim + value_dim)      z -> its own tensor
+            let v_dst = (2 * key_dim + g * ratio * vd + i) * hidden;
+            qkv[v_dst..v_dst + hidden].copy_from_slice(row(qkvz, base + 2 * kd + i, hidden));
+            let z_dst = (g * ratio * vd + i) * hidden;
+            z[z_dst..z_dst + hidden].copy_from_slice(row(qkvz, base + 2 * kd + ratio * vd + i, hidden));
+        }
+    }
+    let (mut b_out, mut a_out) = (None, None);
+    if let Some(ba) = ba {
+        if ba.len() != 2 * nv * hidden {
+            return Err(format!(
+                "fused in_proj_ba: {} floats, expected {} (2 × nv {nv} × hidden {hidden})",
+                ba.len(), 2 * nv * hidden));
+        }
+        let mut bb = vec![0.0f32; nv * hidden];
+        let mut aa = vec![0.0f32; nv * hidden];
+        for g in 0..nk {
+            let base = g * 2 * ratio;
+            for i in 0..ratio {
+                let d = (g * ratio + i) * hidden;
+                bb[d..d + hidden].copy_from_slice(row(ba, base + i, hidden));
+                aa[d..d + hidden].copy_from_slice(row(ba, base + ratio + i, hidden));
+            }
+        }
+        b_out = Some(bb);
+        a_out = Some(aa);
+    }
+    Ok((qkv, z, b_out, a_out))
+}
+
 pub fn is_qwen35_matvec_weight_name(name: &str) -> bool {
     if is_qwen35_moe_weight_name(name) {
         return false;
@@ -4933,6 +5146,10 @@ pub fn is_qwen35_matvec_weight_name(name: &str) -> bool {
         || name.ends_with(".up_proj.weight")
         || name.ends_with(".down_proj.weight")
         || name.ends_with(".in_proj_qkv.weight")
+        // The fused Qwen3-Next pair is SPLIT at load into the four names above;
+        // listing them keeps the non-split paths from routing them to host f32.
+        || name.ends_with(".in_proj_qkvz.weight")
+        || name.ends_with(".in_proj_ba.weight")
         || name.ends_with(".in_proj_z.weight")
         || name.ends_with(".in_proj_a.weight")
         || name.ends_with(".in_proj_b.weight")
@@ -7273,34 +7490,123 @@ mod quant_tests {
         assert!(f16w.is_empty(), "no embed/lm_head in this synthetic shard");
     }
 
+    /// Qwen3-Next fused `in_proj_qkvz` / `in_proj_ba` -> the four block-major
+    /// tensors, by row permutation. Each source row is tagged with a unique
+    /// value so a mis-permutation cannot pass.
+    #[test]
+    fn fused_qkvz_split_permutes_rows_per_key_head_group() {
+        // nk=2 key heads, nv=4 value heads (ratio 2), kd=3, vd=2, hidden=1.
+        let (h, nk, nv, kd, vd) = (1usize, 2usize, 4usize, 3usize, 2usize);
+        let ratio = nv / nk;                       // 2
+        let per_group = 2 * kd + 2 * ratio * vd;   // 6 + 8 = 14 rows
+        // Row r of group g carries the value (g+1)*100 + r.
+        let mut qkvz = vec![0.0f32; per_group * nk * h];
+        for g in 0..nk {
+            for r in 0..per_group {
+                qkvz[(g * per_group + r) * h] = ((g + 1) * 100 + r) as f32;
+            }
+        }
+        // ba: per group, b(ratio) then a(ratio).
+        let mut ba = vec![0.0f32; 2 * nv * h];
+        for g in 0..nk {
+            for r in 0..2 * ratio {
+                ba[(g * 2 * ratio + r) * h] = ((g + 1) * 10 + r) as f32;
+            }
+        }
+        let (qkv, z, b, a) =
+            qwen35_split_fused_qkvz(&qkvz, Some(&ba), h, nk, nv, kd, vd).expect("split");
+        let (key_dim, value_dim) = (nk * kd, nv * vd);
+        assert_eq!(qkv.len(), (2 * key_dim + value_dim) * h);
+        assert_eq!(z.len(), value_dim * h);
+        // q rows: group g, source rows 0..kd -> dst g*kd ..
+        for g in 0..nk {
+            for i in 0..kd {
+                assert_eq!(qkv[(g * kd + i) * h], ((g + 1) * 100 + i) as f32, "q g{g} i{i}");
+                assert_eq!(qkv[(key_dim + g * kd + i) * h], ((g + 1) * 100 + kd + i) as f32,
+                           "k g{g} i{i}");
+            }
+            for i in 0..ratio * vd {
+                assert_eq!(qkv[(2 * key_dim + g * ratio * vd + i) * h],
+                           ((g + 1) * 100 + 2 * kd + i) as f32, "v g{g} i{i}");
+                assert_eq!(z[(g * ratio * vd + i) * h],
+                           ((g + 1) * 100 + 2 * kd + ratio * vd + i) as f32, "z g{g} i{i}");
+            }
+        }
+        let (b, a) = (b.expect("b"), a.expect("a"));
+        for g in 0..nk {
+            for i in 0..ratio {
+                assert_eq!(b[(g * ratio + i) * h], ((g + 1) * 10 + i) as f32, "b g{g} i{i}");
+                assert_eq!(a[(g * ratio + i) * h], ((g + 1) * 10 + ratio + i) as f32, "a g{g} i{i}");
+            }
+        }
+    }
+
+    /// A wrong-sized fused tensor, or a head count that does not divide, is an
+    /// Err with the shape named — never a silent partial split.
+    #[test]
+    fn fused_qkvz_split_refuses_bad_geometry() {
+        let e = qwen35_split_fused_qkvz(&[0.0; 10], None, 1, 2, 4, 3, 2).unwrap_err();
+        assert!(e.contains("expected"), "{e}");
+        let e = qwen35_split_fused_qkvz(&[0.0; 28], None, 1, 3, 4, 3, 2).unwrap_err();
+        assert!(e.contains("not a multiple"), "{e}");
+    }
+
+    /// The text-only HF-flavour detector: `mtp.*` or a `[C,1,K]` conv1d flips it,
+    /// any `language_model` nesting settles the flavour on its own (false), and
+    /// a plain MLX-style text-only checkpoint stays false.
+    #[test]
+    fn hf_flavour_detector_signals() {
+        let c3: &[usize] = &[8, 1, 4];
+        let c2: &[usize] = &[8, 4];
+        let one: &[usize] = &[8];
+        assert!(qwen35_ckpt_is_hf_flavour(vec![
+            ("model.layers.0.input_layernorm.weight", one),
+            ("mtp.fc.weight", &[8, 16][..]),
+        ]));
+        assert!(qwen35_ckpt_is_hf_flavour(vec![
+            ("model.layers.0.linear_attn.conv1d.weight", c3),
+        ]));
+        assert!(!qwen35_ckpt_is_hf_flavour(vec![
+            ("model.layers.0.linear_attn.conv1d.weight", c2),
+        ]));
+        // nested names settle it either way -> never guess
+        assert!(!qwen35_ckpt_is_hf_flavour(vec![
+            ("model.language_model.layers.0.input_layernorm.weight", one),
+            ("mtp.fc.weight", &[8, 16][..]),
+        ]));
+        assert!(!qwen35_ckpt_is_hf_flavour(vec![
+            ("language_model.model.layers.0.linear_attn.conv1d.weight", c3),
+        ]));
+    }
+
     /// The zero-centered predicate: HF-nested norms only, never the gated GDN
     /// norm, never MLX-flavored names (where +1 is already baked in).
     #[test]
     fn hf_zero_centered_norm_predicate() {
         let hf = "model.language_model.layers.7.input_layernorm.weight";
-        assert!(qwen35_hf_zero_centered_norm(hf, "model.layers.7.input_layernorm.weight"));
-        assert!(qwen35_hf_zero_centered_norm(
+        assert!(qwen35_hf_zero_centered_norm_fl(hf, "model.layers.7.input_layernorm.weight", false));
+        assert!(qwen35_hf_zero_centered_norm_fl(
             "model.language_model.layers.3.self_attn.q_norm.weight",
-            "model.layers.3.self_attn.q_norm.weight"));
-        assert!(qwen35_hf_zero_centered_norm(
+            "model.layers.3.self_attn.q_norm.weight", false));
+        assert!(qwen35_hf_zero_centered_norm_fl(
             "model.language_model.layers.3.self_attn.k_norm.weight",
-            "model.layers.3.self_attn.k_norm.weight"));
-        assert!(qwen35_hf_zero_centered_norm(
-            "model.language_model.norm.weight", "model.norm.weight"));
-        assert!(qwen35_hf_zero_centered_norm(
+            "model.layers.3.self_attn.k_norm.weight", false));
+        assert!(qwen35_hf_zero_centered_norm_fl(
+            "model.language_model.norm.weight", "model.norm.weight", false));
+        assert!(qwen35_hf_zero_centered_norm_fl(
             "model.language_model.layers.0.post_attention_layernorm.weight",
-            "model.layers.0.post_attention_layernorm.weight"));
+            "model.layers.0.post_attention_layernorm.weight", false));
         // gated GDN norm: plain in both exports.
-        assert!(!qwen35_hf_zero_centered_norm(
+        assert!(!qwen35_hf_zero_centered_norm_fl(
             "model.language_model.layers.0.linear_attn.norm.weight",
-            "model.layers.0.linear_attn.norm.weight"));
+            "model.layers.0.linear_attn.norm.weight", false));
         // MLX flavor: +1 already baked into the stored weight.
-        assert!(!qwen35_hf_zero_centered_norm(
+        assert!(!qwen35_hf_zero_centered_norm_fl(
             "language_model.model.layers.7.input_layernorm.weight",
-            "model.layers.7.input_layernorm.weight"));
-        assert!(!qwen35_hf_zero_centered_norm(
+            "model.layers.7.input_layernorm.weight", false));
+        assert!(!qwen35_hf_zero_centered_norm_fl(
             "model.layers.7.input_layernorm.weight",
-            "model.layers.7.input_layernorm.weight"));
+            "model.layers.7.input_layernorm.weight", false));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::model;
 use crate::gpu_error::GpuResult;
 use crate::VulkanModel;
 use crate::{
-    matvec_pc13, matvec_variant, sdpa_pc, rmsnorm_pc, f32_slice_to_bytes, read_f32_buf,
+    sdpa_pc, rmsnorm_pc, f32_slice_to_bytes, read_f32_buf,
 };
 use crate::{unified_1cb_enabled, attn_decode_kernel, prof_add};
 use crate::layer_core::{
@@ -908,32 +908,39 @@ impl VulkanModel {
         // gate in gemma_forward.rs (the `layer_scalar` multiply below still
         // runs unconditionally on every gemma layer, has_ple() or not).
         if ple_dim > 0 {
-            let (ps, prr) = matvec_variant(true, ple_dim);
-            let mv_pg = matvec_pc13(h, ple_dim);
-            let pgw = &self.gpu_weights[&ln("per_layer_input_gate.weight")].buffer as *const compute::Buffer;
-            let ffin_p = self.ures_ptr(UR_FFIN);
-            let pg_p = self.ures_ptr(UR_PLE_G);
+            // Format-aware dispatch (`gemma_res_mv_kind` + `record_gemma_mv`):
+            // `matvec_variant` reads the GLOBAL VLLM_VULKAN_QUANT snapshot, so a
+            // PLE weight uploaded in any other format (mlx4/q8_0/nvfp4/fp8) got
+            // the wrong kernel and silently wrong numbers. The rest of the
+            // unified path already dispatches on the weight's OWN format.
+            let (pgw_w, ffin_p, pg_p) = (
+                &self.gpu_weights[&ln("per_layer_input_gate.weight")] as *const crate::GpuWeight,
+                self.ures_ptr(UR_FFIN), self.ures_ptr(UR_PLE_G));
+            let (pg_fmt, pg_kind) = crate::gemma_forward::gemma_res_mv_kind(unsafe { &*pgw_w });
+            let pgw = unsafe { &(*pgw_w).buffer as *const compute::Buffer };
             unsafe { (*self.ures_ptr_mut(UR_FFIN)).write(&f32_slice_to_bytes(&hidden3))?; }
             let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
             let cb = eng.begin_batch()?;
             unsafe {
-                eng.record_to(cb, &ps, &[&*pgw, &*ffin_p, &*pg_p], &mv_pg, ((ple_dim as u32).div_ceil(prr), 1, 1))?;
+                crate::gemma_forward::record_gemma_mv(eng, cb, pgw, pg_fmt, pg_kind,
+                    ffin_p, pg_p, h, ple_dim);
             }
             eng.submit_batch(cb)?;
             let gate_ple = read_f32_buf(unsafe { &*pg_p }, ple_dim);
             let gate_ple_act = model::cpu_gelu(&gate_ple);
             let gated: Vec<f32> = gate_ple_act.iter().zip(ple.layer_ple.iter()).map(|(&g, &p)| g * p).collect();
 
-            let (pps, pprr) = matvec_variant(true, h);
-            let mv_pp = matvec_pc13(ple_dim, h);
-            let ppw = &self.gpu_weights[&ln("per_layer_projection.weight")].buffer as *const compute::Buffer;
+            let ppw_w = &self.gpu_weights[&ln("per_layer_projection.weight")] as *const crate::GpuWeight;
+            let (pp_fmt, pp_kind) = crate::gemma_forward::gemma_res_mv_kind(unsafe { &*ppw_w });
+            let ppw = unsafe { &(*ppw_w).buffer as *const compute::Buffer };
             let pg_in = self.ures_ptr(UR_PLE_G);
             let pc_p = self.ures_ptr(UR_PLE_C);
             unsafe { (*self.ures_ptr_mut(UR_PLE_G)).write(&f32_slice_to_bytes(&gated))?; }
             let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
             let cb = eng.begin_batch()?;
             unsafe {
-                eng.record_to(cb, &pps, &[&*ppw, &*pg_in, &*pc_p], &mv_pp, ((h as u32).div_ceil(pprr), 1, 1))?;
+                crate::gemma_forward::record_gemma_mv(eng, cb, ppw, pp_fmt, pp_kind,
+                    pg_in, pc_p, ple_dim, h);
             }
             eng.submit_batch(cb)?;
             let contrib = read_f32_buf(unsafe { &*pc_p }, h);
@@ -1034,16 +1041,16 @@ impl VulkanModel {
         let xp = self.ures_ptr(UR_X);
         let logitp = self.ures_ptr(UR_LOGITS);
         let norm_p = &self.unified_norm_w["model.norm.weight"] as *const compute::Buffer;
-        let lmw = &self.gpu_weights[&lm_name].buffer as *const compute::Buffer;
-        let (lms, lmr) = matvec_variant(true, vocab);
+        let lmw_w = &self.gpu_weights[&lm_name] as *const crate::GpuWeight;
+        let (lm_fmt, lm_kind) = crate::gemma_forward::gemma_res_mv_kind(unsafe { &*lmw_w });
+        let lmw = unsafe { &(*lmw_w).buffer as *const compute::Buffer };
         let rms_f = rmsnorm_pc(h, eps);
-        let mv_lm = matvec_pc13(h, vocab);
         let eng = self.engine.as_mut().expect("invariant: forward_unified_qwen only called when self.engine is Some");
         let cb = eng.begin_batch()?;
         unsafe {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*ha, &*norm_p, &*xp], &rms_f, (1, 1, 1))?;
             eng.record_barrier_to(cb);
-            eng.record_to(cb, &lms, &[&*lmw, &*xp, &*logitp], &mv_lm, ((vocab as u32).div_ceil(lmr), 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, lmw, lm_fmt, lm_kind, xp, logitp, h, vocab);
         }
         eng.submit_batch(cb)?;
         Ok(read_f32_buf(unsafe { &*logitp }, vocab))
